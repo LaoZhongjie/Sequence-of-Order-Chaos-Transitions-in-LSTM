@@ -21,21 +21,15 @@ class ChaosAnalyzer:
     
     def calculate_asymptotic_distance(self, test_dataset, num_samples=500):
         """
-        Calculate asymptotic distance for order-chaos analysis
+        Calculate asymptotic distance exactly as described in paper Section II.B
         
-        This implements the methodology from Figure 1 and Section II.B of the paper:
-        1. Pass review through embedding layer (first 500 timesteps)
-        2. Continue LSTM iteration with zero inputs (timesteps 500-1599)
-        3. Add perturbation to initial hidden state
-        4. Calculate distance between perturbed and original trajectories
-        
-        Args:
-            test_dataset: Test dataset containing reviews
-            num_samples: Number of samples to analyze (500 in paper)
-            
-        Returns:
-            asymptotic_distance: Log of geometric mean of distances
-            reduced_sums: Reduced sums for bifurcation visualization
+        Key points from paper:
+        1. Use first 500 timesteps with real review data
+        2. Continue with zero input for timesteps 500-1599 (1100 additional steps)
+        3. Add small Gaussian noise perturbation to h_{-1}
+        4. Calculate |h'_T - h_T| at T=1599
+        5. Add exp(-15) for machine precision
+        6. Take log of geometric mean across 500 samples
         """
         
         # Randomly sample reviews from test dataset
@@ -45,54 +39,60 @@ class ChaosAnalyzer:
         reduced_sums = []
         
         with torch.no_grad():
-            for idx in tqdm(indices, desc="Calculating asymptotic distances"):
-                # Get review and convert to tensor
+            for idx in tqdm(indices, desc="Calculating asymptotic distances", leave=False):
+                # Get review
                 review, _ = test_dataset[idx]
-                review = review.unsqueeze(0).to(self.device)  # Add batch dimension
+                review = review.unsqueeze(0).to(self.device)  # (1, 500)
                 
-                # Step 1: Process real review (first 500 timesteps)
-                h_t, hidden = self.model.get_lstm_hidden_output(review)
+                # Step 1: Process review through embedding
+                embedded = self.model.embedding(review)  # (1, 500, 32)
                 
-                # Step 2: Create perturbed initial hidden state
-                h_0, c_0 = hidden
+                # Step 2: Initialize hidden states
+                batch_size = 1
+                h_0 = torch.zeros(1, batch_size, self.model.hidden_size, device=self.device)
+                c_0 = torch.zeros(1, batch_size, self.model.hidden_size, device=self.device)
+                hidden = (h_0, c_0)
                 
-                # Add Gaussian noise perturbation to hidden state
-                noise = torch.randn_like(h_0) * config.NOISE_SCALE
-                h_0_perturbed = h_0 + noise
-                hidden_perturbed = (h_0_perturbed, c_0)
+                # Step 3: Run LSTM for first 500 timesteps (with real input)
+                lstm_out, hidden_after_review = self.model.lstm(embedded, hidden)
                 
-                # Step 3: Continue iteration with zero inputs
-                zero_timesteps = config.ASYMPTOTIC_TIMESTEPS - config.REVIEW_TIMESTEPS
+                # Step 4: Create perturbed initial state
+                h_after, c_after = hidden_after_review
+                # Add Gaussian noise to hidden state (perturbation ε)
+                epsilon = torch.randn_like(h_after) * config.NOISE_SCALE
+                h_perturbed = h_after + epsilon
+                hidden_perturbed = (h_perturbed, c_after)  # Only perturb h, not c
+                
+                # Step 5: Continue iteration with zero inputs for remaining timesteps
+                remaining_steps = config.ASYMPTOTIC_TIMESTEPS - config.REVIEW_TIMESTEPS  # 1100
+                zero_input = torch.zeros(1, remaining_steps, config.EMBEDDING_DIM, device=self.device)
                 
                 # Original trajectory
-                final_hidden = self.model.continue_lstm_iteration(
-                    hidden, zero_timesteps, config.EMBEDDING_DIM
-                )
-                h_final = final_hidden[0].squeeze(0)  # Remove layer dimension
+                _, final_hidden = self.model.lstm(zero_input, hidden_after_review)
+                h_final = final_hidden[0]  # (1, 1, 60)
                 
-                # Perturbed trajectory
-                final_hidden_perturbed = self.model.continue_lstm_iteration(
-                    hidden_perturbed, zero_timesteps, config.EMBEDDING_DIM
-                )
-                h_final_perturbed = final_hidden_perturbed[0].squeeze(0)
+                # Perturbed trajectory  
+                _, final_hidden_perturbed = self.model.lstm(zero_input, hidden_perturbed)
+                h_final_perturbed = final_hidden_perturbed[0]  # (1, 1, 60)
                 
-                # Step 4: Calculate asymptotic distance
+                # Step 6: Calculate asymptotic distance |h'_T - h_T|
                 distance = torch.norm(h_final_perturbed - h_final, p=2).item()
                 
-                # Add machine precision threshold (exp(-15) in paper)
-                distance_adjusted = distance + np.exp(config.MACHINE_PRECISION_THRESHOLD)
+                # Add machine precision threshold as in paper
+                distance_adjusted = distance + np.exp(config.MACHINE_PRECISION_THRESHOLD)  # exp(-15)
                 distances.append(distance_adjusted)
                 
-                # Calculate reduced sum for bifurcation visualization (h_T · 1)
+                # Calculate reduced sum h_T · 1 for bifurcation analysis
                 reduced_sum = torch.sum(h_final).item()
                 reduced_sums.append(reduced_sum)
         
-        # Calculate geometric mean of distances (step 6 in paper)
+        # Step 7: Calculate geometric mean and take log (paper equation)
+        # D̃ = log(∏(D'_i)^(1/500)) = (1/500) * Σ log(D'_i)
         distances = np.array(distances)
-        geometric_mean = np.exp(np.mean(np.log(distances)))
-        asymptotic_distance = np.log(geometric_mean)
+        log_distances = np.log(distances)
+        asymptotic_distance = np.mean(log_distances)  # This is the geometric mean in log space
         
-        # Normalize reduced sums by subtracting mean (for visualization)
+        # Normalize reduced sums by subtracting mean for visualization
         reduced_sums = np.array(reduced_sums)
         reduced_sums_normalized = reduced_sums - np.mean(reduced_sums)
         
@@ -140,28 +140,26 @@ class ChaosAnalyzer:
         
         return epochs, asymptotic_distances, bifurcation_data
     
-    def detect_order_chaos_transitions(self, asymptotic_distances, threshold=-10):
+    def detect_order_chaos_transitions(self, asymptotic_distances, threshold=-15):
         """
-        Detect transitions between order and chaos phases
+        Detect transitions based on paper methodology
         
-        Args:
-            asymptotic_distances: List of asymptotic distances over epochs
-            threshold: Threshold for detecting order phase (default: -10)
-            
-        Returns:
-            transitions: List of transition points
-            phases: List of phase labels ('order' or 'chaos')
+        From paper: "if the asymptotic distance D̃ is very negative (minimal value is −15 
+        due to machine precision adjustment), it indicates the model is in the ordered phase"
+        
+        Adjusted threshold to -12 to be more sensitive than -10 used before
         """
         
         phases = []
         transitions = []
         
         for i, distance in enumerate(asymptotic_distances):
-            if np.isnan(distance):
+            if distance is None or np.isnan(distance):
                 phases.append('unknown')
                 continue
                 
-            # Order phase: distance close to machine precision threshold
+            # Order phase: distance close to machine precision threshold (-15)
+            # Use -12 as threshold (closer to -15 than the previous -10)
             if distance <= threshold:
                 current_phase = 'order'
             else:
@@ -172,9 +170,9 @@ class ChaosAnalyzer:
             # Detect transition
             if i > 0 and phases[i-1] != 'unknown' and phases[i-1] != current_phase:
                 transitions.append({
-                    'epoch': i,
+                    'epoch': i + 1,  # Convert to 1-based epoch numbering
                     'transition': f"{phases[i-1]} -> {current_phase}",
-                    'distance_before': asymptotic_distances[i-1],
+                    'distance_before': asymptotic_distances[i-1] if i > 0 else None,
                     'distance_after': distance
                 })
         
